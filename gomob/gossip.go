@@ -1,19 +1,25 @@
 package gomob
 
+// Adapted from https://github.com/asim/memberlist
+
 import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
-	"regexp"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/hashicorp/memberlist"
+	"github.com/pborman/uuid"
 )
 
 var (
 	mtx        sync.RWMutex
+	members    = flag.String("members", "", "comma seperated list of members")
+	port       = flag.Int("port", 4001, "http port")
 	items      = map[string]string{}
 	broadcasts *memberlist.TransmitLimitedQueue
 )
@@ -57,25 +63,8 @@ func (d *delegate) NotifyMsg(b []byte) {
 		return
 	}
 
-	switch b[0] {
-	case 'd': // data
-		var updates []*update
-		if err := json.Unmarshal(b[1:], &updates); err != nil {
-			return
-		}
-		mtx.Lock()
-		for _, u := range updates {
-			for k, v := range u.Data {
-				switch u.Action {
-				case "add":
-					items[k] = v
-				case "del":
-					delete(items, k)
-				}
-			}
-		}
-		mtx.Unlock()
-	}
+	fmt.Println("Received message notification:")
+	fmt.Println(string(b))
 }
 
 func (d *delegate) GetBroadcasts(overhead, limit int) [][]byte {
@@ -108,108 +97,109 @@ func (d *delegate) MergeRemoteState(buf []byte, join bool) {
 	mtx.Unlock()
 }
 
-func CreateCluster() {
-	fmt.Println("Starting up.")
+func addHandler(w http.ResponseWriter, r *http.Request) {
+	r.ParseForm()
+	key := r.Form.Get("key")
+	val := r.Form.Get("val")
+	mtx.Lock()
+	items[key] = val
+	mtx.Unlock()
+
+	b, err := json.Marshal([]*update{
+		&update{
+			Action: "add",
+			Data: map[string]string{
+				key: val,
+			},
+		},
+	})
+
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+
+	broadcasts.QueueBroadcast(&broadcast{
+		msg:    append([]byte("d"), b...),
+		notify: nil,
+	})
+}
+
+func delHandler(w http.ResponseWriter, r *http.Request) {
+	r.ParseForm()
+	key := r.Form.Get("key")
+	mtx.Lock()
+	delete(items, key)
+	mtx.Unlock()
+
+	b, err := json.Marshal([]*update{
+		&update{
+			Action: "del",
+			Data: map[string]string{
+				key: "",
+			},
+		},
+	})
+
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+
+	broadcasts.QueueBroadcast(&broadcast{
+		msg:    append([]byte("d"), b...),
+		notify: nil,
+	})
+}
+
+func getHandler(w http.ResponseWriter, r *http.Request) {
+	r.ParseForm()
+	key := r.Form.Get("key")
+	mtx.RLock()
+	val := items[key]
+	mtx.RUnlock()
+	w.Write([]byte(val))
+}
+
+func start() error {
 	hostname, _ := os.Hostname()
-	master := hostname == "node01"
-
-	// Hard code hostname and IP address
-	var hostMap = make(map[string]string)
-	hostMap["node01"] = "192.168.50.10"
-	hostMap["node02"] = "192.168.50.11"
-	hostMap["node03"] = "192.168.50.12"
-	hostMap["node04"] = "192.168.50.13"
-
-	config := memberlist.DefaultLocalConfig()
-	config.BindAddr = hostMap[hostname]
-	list, err := memberlist.Create(config)
+	c := memberlist.DefaultLocalConfig()
+	c.Delegate = &delegate{}
+	c.BindPort = 0
+	c.Name = hostname + "-" + uuid.NewUUID().String()
+	m, err := memberlist.Create(c)
 	if err != nil {
-		fmt.Println("Failed to create memberlist: " + err.Error())
+		return err
 	}
-
-	// Join
-	_, err = list.Join([]string{hostMap["node01"]})
-	if err != nil {
-		fmt.Println("Failed to join cluster: " + err.Error())
+	if len(*members) > 0 {
+		parts := strings.Split(*members, ",")
+		_, err := m.Join(parts)
+		if err != nil {
+			return err
+		}
 	}
-
 	broadcasts = &memberlist.TransmitLimitedQueue{
 		NumNodes: func() int {
-			return list.NumMembers()
+			return m.NumMembers()
 		},
 		RetransmitMult: 3,
 	}
+	node := m.LocalNode()
+	fmt.Printf("Local member %s:%d\n", node.Addr, node.Port)
+	return nil
+}
 
-	c := make(chan bool)
-
-	go func() {
-		for {
-			time.Sleep(time.Second * 2)
-			// for _, member := range list.Members() {
-			// 	if list.NumMembers() > 1 {
-			// 		b := broadcast{msg: []byte(fmt.Sprintf("hello world — %s", member.Name))}
-			// 		broadcasts.QueueBroadcast(&b)
-			// 	}
-			// }
-			// msgs := broadcasts.GetBroadcasts(1, 1024)
-			// for _, msg := range msgs {
-			// 	fmt.Println(string(msg))
-			// }
-
-			if list.NumMembers() > 1 {
-				c <- true
-			}
-		}
-	}()
-
-	<-c
-	if master {
-		proposeTime(broadcasts)
+func CreateCluster() {
+	if err := start(); err != nil {
+		fmt.Println(err)
 	}
 
 	for {
-		time.Sleep(time.Second * 5)
-		// numAckd := 0
-
-		if master {
-			b := broadcast{msg: []byte("master node")}
+		time.Sleep(time.Second)
+		if hostname, _ := os.Hostname(); hostname != "node01" {
+			b := broadcast{msg: []byte("hello world"), notify: nil}
 			broadcasts.QueueBroadcast(&b)
-			// fmt.Printf("Received %d broadcast messages\n", len(msgs))
-			// for _, msg := range msgs {
-			// 	if string(msg) == "ACK_TIME" { // TODO: include timestamp in ACK message
-			// 		numAckd++
-			// 	} else {
-			// 		proposeTime(broadcasts)
-			// 	}
-			// 	fmt.Println(string(msg))
-			// 	fmt.Println("Num ACKd", numAckd)
-			// }
-
-			// if numAckd == list.NumMembers()-1 {
-			// 	fmt.Println("All peers ACK'd")
-			// }
-		} else {
-			msgs := broadcasts.GetBroadcasts(5, 1024)
-			fmt.Println("Num messages received: ", len(msgs))
-			for _, msg := range msgs {
-				fmt.Println(string(msg))
-				rgx, _ := regexp.Compile("Propose")
-				match := rgx.Match(msg)
-				fmt.Println(string(msg))
-				if match {
-					fmt.Println("Acknowledging")
-					newMsg := broadcast{msg: []byte("ACK_TIME")}
-					broadcasts.QueueBroadcast(&newMsg)
-				}
-			}
 		}
+
 	}
-}
-
-func proposeTime(broadcasts *memberlist.TransmitLimitedQueue) {
-	t := time.Now().UTC().Add(30 * time.Second)
-
-	fmt.Println("Proposing new time to peers")
-	b := broadcast{msg: []byte(fmt.Sprint("Propose: ", t)), notify: nil}
-	broadcasts.QueueBroadcast(&b)
 }
