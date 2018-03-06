@@ -22,10 +22,13 @@ var (
 	port            = flag.Int("port", 4001, "http port")
 	items           = map[string]string{}
 	broadcasts      *memberlist.TransmitLimitedQueue
-	isMasterNode    bool
+	isMasterNode    = flag.Bool("master", false, "define as master node")
 	timeProposeFlag = 'T'
+	executeFlag     = 'E'
 	ackFlag         = 'A'
 	ackCount        = 0
+	minAcks         int
+	done            chan bool
 )
 
 type broadcast struct {
@@ -81,12 +84,22 @@ func (d *delegate) NotifyMsg(b []byte) {
 			fmt.Println("Time not accepted")
 		}
 	case byte(ackFlag):
-		if isMasterNode {
+		fmt.Println("Time proposal was ack'd")
+		fmt.Println("Is master?", isMasterNode)
+		if *isMasterNode {
 			mtx.Lock()
 			ackCount++
+			fmt.Println("num acks:", ackCount)
+			fmt.Println("min acks:", minAcks)
+			if ackCount == minAcks {
+				proposeNewTime(true)
+			}
 			mtx.Unlock()
 			// TODO: if ack count is at right number, start execution sequence
 		}
+	case byte(executeFlag):
+		fmt.Println("preparing to execute")
+		// blockUntilTime(b[1:])
 	default:
 		fmt.Println("Unknown message type received")
 	}
@@ -150,9 +163,15 @@ func setup() (*memberlist.Memberlist, error) {
 	return list, nil
 }
 
-func proposeNewTime() {
+func proposeNewTime(finalize bool) {
 	t := time.Now().UTC().Add(time.Second * 30).Unix()
-	tStr := fmt.Sprintf("%c%d", timeProposeFlag, t)
+	var flag rune
+	if finalize {
+		flag = executeFlag
+	} else {
+		flag = timeProposeFlag
+	}
+	tStr := fmt.Sprintf("%c%d", flag, t)
 	fmt.Printf("Sending message:\n\t%s\n", tStr)
 	b := broadcast{
 		msg:    []byte(tStr),
@@ -180,34 +199,35 @@ func validateTimeUpdate(unix string) (bool, error) {
 	return v, nil
 }
 
-func CreateCluster() {
+func WaitOnConsensus() {
 	list, err := setup()
 	if err != nil {
 		fmt.Println(err)
 	}
 
-	hostname, _ := os.Hostname()
-	isMasterNode := hostname == "node01"
-
-	for {
-		broadcasts.RetransmitMult = list.NumMembers() - 1
-		if list.NumMembers() >= 2 {
-			if isMasterNode {
-				mtx.Lock()
-				ackCount = 0
-				mtx.Unlock()
-				proposeNewTime()
-				time.Sleep(time.Second * 30) // wait until expiry time has passed before proposing again
-			}
-		} else {
-			fmt.Println("Num members:", list.NumMembers())
-			time.Sleep(time.Second * 5)
-		}
-
-		// if hostname, _ := os.Hostname(); hostname != "node01" {
-		// 	b := broadcast{msg: []byte("hello world"), notify: nil}
-		// 	broadcasts.QueueBroadcast(&b)
-		// }
-
+	if *isMasterNode {
+		fmt.Println("Starting up as master node.")
 	}
+
+	go func() {
+		for {
+			broadcasts.RetransmitMult = list.NumMembers() - 1
+			minAcks = list.NumMembers() - 1
+			if list.NumMembers() > 1 {
+				if *isMasterNode {
+					mtx.Lock()
+					ackCount = 0
+					mtx.Unlock()
+					proposeNewTime(false)
+					time.Sleep(time.Second * 30) // wait until expiry time has passed before proposing again
+				}
+			} else {
+				fmt.Println("Num members:", list.NumMembers())
+				time.Sleep(time.Second * 5)
+			}
+		}
+	}()
+
+	isDone := <-done
+	fmt.Println("Done:", isDone)
 }
