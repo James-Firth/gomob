@@ -4,6 +4,7 @@ package gomob
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -76,7 +77,7 @@ func (d *delegate) NotifyMsg(b []byte) {
 	case byte(timeProposeFlag):
 		accept, err := validateTimeUpdate(string(b[1:]))
 		if err != nil {
-			// TODO: send error response? ignore and move on?
+			panic(err)
 		}
 		if accept {
 			sendTimeAck()
@@ -84,24 +85,32 @@ func (d *delegate) NotifyMsg(b []byte) {
 			fmt.Println("Time not accepted")
 		}
 	case byte(ackFlag):
-		fmt.Println("Time proposal was ack'd")
-		fmt.Println("Is master?", isMasterNode)
 		if *isMasterNode {
 			mtx.Lock()
 			ackCount++
-			fmt.Println("num acks:", ackCount)
-			fmt.Println("min acks:", minAcks)
 			if ackCount == minAcks {
-				proposeNewTime(true)
+				t := proposeNewTime(true)
+				go func() {
+					err := blockUntilTime(fmt.Sprintf("%d", t.Unix()))
+					if err != nil {
+						panic(err)
+					}
+					fmt.Println("Executing now...")
+					done <- true
+				}()
 			}
 			mtx.Unlock()
-			// TODO: if ack count is at right number, start execution sequence
 		}
 	case byte(executeFlag):
 		fmt.Println("preparing to execute")
-		// blockUntilTime(b[1:])
+		err := blockUntilTime(string(b[1:]))
+		if err != nil {
+			panic(err)
+		}
+		fmt.Println("Executing now...")
+		done <- true
 	default:
-		fmt.Println("Unknown message type received")
+		panic(errors.New("Unkown message type received"))
 	}
 }
 
@@ -163,7 +172,7 @@ func setup() (*memberlist.Memberlist, error) {
 	return list, nil
 }
 
-func proposeNewTime(finalize bool) {
+func proposeNewTime(finalize bool) time.Time {
 	t := time.Now().UTC().Add(time.Second * 30).Unix()
 	var flag rune
 	if finalize {
@@ -178,6 +187,8 @@ func proposeNewTime(finalize bool) {
 		notify: nil,
 	}
 	broadcasts.QueueBroadcast(&b)
+
+	return time.Unix(t, 0)
 }
 
 func sendTimeAck() {
@@ -199,6 +210,21 @@ func validateTimeUpdate(unix string) (bool, error) {
 	return v, nil
 }
 
+func blockUntilTime(unix string) error {
+	i, err := strconv.ParseInt(unix, 10, 64)
+	if err != nil {
+		return err
+	}
+
+	execTime := time.Unix(i, 0)
+
+	c := time.After(execTime.Sub(time.Now().UTC()))
+
+	<-c // channel blocks until time.After() has executed
+
+	return nil
+}
+
 func WaitOnConsensus() {
 	list, err := setup()
 	if err != nil {
@@ -209,10 +235,12 @@ func WaitOnConsensus() {
 		fmt.Println("Starting up as master node.")
 	}
 
+	done = make(chan bool)
+
 	go func() {
 		for {
 			broadcasts.RetransmitMult = list.NumMembers() - 1
-			minAcks = list.NumMembers() - 1
+			minAcks = 2
 			if list.NumMembers() > 1 {
 				if *isMasterNode {
 					mtx.Lock()
@@ -228,6 +256,7 @@ func WaitOnConsensus() {
 		}
 	}()
 
+	fmt.Println("Waiting to receive done message")
 	isDone := <-done
 	fmt.Println("Done:", isDone)
 }
