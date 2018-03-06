@@ -6,8 +6,8 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -22,7 +22,10 @@ var (
 	port            = flag.Int("port", 4001, "http port")
 	items           = map[string]string{}
 	broadcasts      *memberlist.TransmitLimitedQueue
+	isMasterNode    bool
 	timeProposeFlag = 'T'
+	ackFlag         = 'A'
+	ackCount        = 0
 )
 
 type broadcast struct {
@@ -65,16 +68,27 @@ func (d *delegate) NotifyMsg(b []byte) {
 	}
 
 	fmt.Println("Received message notification:")
-	fmt.Println(string(b))
+	fmt.Printf("\t%s\n", string(b))
 	switch b[0] {
 	case byte(timeProposeFlag):
-		accept, err := validateTimeUpdate()
+		accept, err := validateTimeUpdate(string(b[1:]))
 		if err != nil {
 			// TODO: send error response? ignore and move on?
 		}
 		if accept {
 			sendTimeAck()
+		} else {
+			fmt.Println("Time not accepted")
 		}
+	case byte(ackFlag):
+		if isMasterNode {
+			mtx.Lock()
+			ackCount++
+			mtx.Unlock()
+			// TODO: if ack count is at right number, start execution sequence
+		}
+	default:
+		fmt.Println("Unknown message type received")
 	}
 }
 
@@ -108,71 +122,7 @@ func (d *delegate) MergeRemoteState(buf []byte, join bool) {
 	mtx.Unlock()
 }
 
-func addHandler(w http.ResponseWriter, r *http.Request) {
-	r.ParseForm()
-	key := r.Form.Get("key")
-	val := r.Form.Get("val")
-	mtx.Lock()
-	items[key] = val
-	mtx.Unlock()
-
-	b, err := json.Marshal([]*update{
-		&update{
-			Action: "add",
-			Data: map[string]string{
-				key: val,
-			},
-		},
-	})
-
-	if err != nil {
-		http.Error(w, err.Error(), 500)
-		return
-	}
-
-	broadcasts.QueueBroadcast(&broadcast{
-		msg:    append([]byte("d"), b...),
-		notify: nil,
-	})
-}
-
-func delHandler(w http.ResponseWriter, r *http.Request) {
-	r.ParseForm()
-	key := r.Form.Get("key")
-	mtx.Lock()
-	delete(items, key)
-	mtx.Unlock()
-
-	b, err := json.Marshal([]*update{
-		&update{
-			Action: "del",
-			Data: map[string]string{
-				key: "",
-			},
-		},
-	})
-
-	if err != nil {
-		http.Error(w, err.Error(), 500)
-		return
-	}
-
-	broadcasts.QueueBroadcast(&broadcast{
-		msg:    append([]byte("d"), b...),
-		notify: nil,
-	})
-}
-
-func getHandler(w http.ResponseWriter, r *http.Request) {
-	r.ParseForm()
-	key := r.Form.Get("key")
-	mtx.RLock()
-	val := items[key]
-	mtx.RUnlock()
-	w.Write([]byte(val))
-}
-
-func start() (*memberlist.Memberlist, error) {
+func setup() (*memberlist.Memberlist, error) {
 	hostname, _ := os.Hostname()
 	c := memberlist.DefaultLocalConfig()
 	c.Delegate = &delegate{}
@@ -193,7 +143,7 @@ func start() (*memberlist.Memberlist, error) {
 		NumNodes: func() int {
 			return list.NumMembers()
 		},
-		RetransmitMult: 3,
+		RetransmitMult: 2,
 	}
 	node := list.LocalNode()
 	fmt.Printf("Local member %s:%d\n", node.Addr, node.Port)
@@ -201,8 +151,8 @@ func start() (*memberlist.Memberlist, error) {
 }
 
 func proposeNewTime() {
-	t := time.Now().UTC().Add(time.Second * 30)
-	tStr := fmt.Sprintf("%c%t", timeProposeFlag, t)
+	t := time.Now().UTC().Add(time.Second * 30).Unix()
+	tStr := fmt.Sprintf("%c%d", timeProposeFlag, t)
 	fmt.Printf("Sending message:\n\t%s\n", tStr)
 	b := broadcast{
 		msg:    []byte(tStr),
@@ -212,15 +162,26 @@ func proposeNewTime() {
 }
 
 func sendTimeAck() {
-	fmt.Println("ACK")
+	b := broadcast{
+		msg:    []byte("ACK"),
+		notify: nil,
+	}
+	broadcasts.QueueBroadcast(&b)
 }
 
-func validateTimeUpdate() (bool, error) {
-	return true, nil
+func validateTimeUpdate(unix string) (bool, error) {
+	t, err := strconv.ParseInt(unix, 10, 64)
+	if err != nil {
+		return false, err
+	}
+
+	v := time.Now().UTC().Unix() < t
+
+	return v, nil
 }
 
 func CreateCluster() {
-	list, err := start()
+	list, err := setup()
 	if err != nil {
 		fmt.Println(err)
 	}
@@ -229,15 +190,20 @@ func CreateCluster() {
 	isMasterNode := hostname == "node01"
 
 	for {
-		if list.NumMembers() == 2 {
+		broadcasts.RetransmitMult = list.NumMembers() - 1
+		if list.NumMembers() >= 2 {
 			if isMasterNode {
+				mtx.Lock()
+				ackCount = 0
+				mtx.Unlock()
 				proposeNewTime()
+				time.Sleep(time.Second * 30) // wait until expiry time has passed before proposing again
 			}
 		} else {
 			fmt.Println("Num members:", list.NumMembers())
+			time.Sleep(time.Second * 5)
 		}
 
-		time.Sleep(time.Second * 5)
 		// if hostname, _ := os.Hostname(); hostname != "node01" {
 		// 	b := broadcast{msg: []byte("hello world"), notify: nil}
 		// 	broadcasts.QueueBroadcast(&b)
