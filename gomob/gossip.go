@@ -17,11 +17,12 @@ import (
 )
 
 var (
-	mtx        sync.RWMutex
-	members    = flag.String("members", "", "comma seperated list of members")
-	port       = flag.Int("port", 4001, "http port")
-	items      = map[string]string{}
-	broadcasts *memberlist.TransmitLimitedQueue
+	mtx             sync.RWMutex
+	members         = flag.String("members", "", "comma seperated list of members")
+	port            = flag.Int("port", 4001, "http port")
+	items           = map[string]string{}
+	broadcasts      *memberlist.TransmitLimitedQueue
+	timeProposeFlag = 'T'
 )
 
 type broadcast struct {
@@ -65,6 +66,16 @@ func (d *delegate) NotifyMsg(b []byte) {
 
 	fmt.Println("Received message notification:")
 	fmt.Println(string(b))
+	switch b[0] {
+	case byte(timeProposeFlag):
+		accept, err := validateTimeUpdate()
+		if err != nil {
+			// TODO: send error response? ignore and move on?
+		}
+		if accept {
+			sendTimeAck()
+		}
+	}
 }
 
 func (d *delegate) GetBroadcasts(overhead, limit int) [][]byte {
@@ -161,45 +172,76 @@ func getHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(val))
 }
 
-func start() error {
+func start() (*memberlist.Memberlist, error) {
 	hostname, _ := os.Hostname()
 	c := memberlist.DefaultLocalConfig()
 	c.Delegate = &delegate{}
-	c.BindPort = 0
+	c.BindPort = 7777
 	c.Name = hostname + "-" + uuid.NewUUID().String()
-	m, err := memberlist.Create(c)
+	list, err := memberlist.Create(c)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if len(*members) > 0 {
 		parts := strings.Split(*members, ",")
-		_, err := m.Join(parts)
+		_, err := list.Join(parts)
 		if err != nil {
-			return err
+			return nil, err
 		}
 	}
 	broadcasts = &memberlist.TransmitLimitedQueue{
 		NumNodes: func() int {
-			return m.NumMembers()
+			return list.NumMembers()
 		},
 		RetransmitMult: 3,
 	}
-	node := m.LocalNode()
+	node := list.LocalNode()
 	fmt.Printf("Local member %s:%d\n", node.Addr, node.Port)
-	return nil
+	return list, nil
+}
+
+func proposeNewTime() {
+	t := time.Now().UTC().Add(time.Second * 30)
+	tStr := fmt.Sprintf("%c%t", timeProposeFlag, t)
+	fmt.Printf("Sending message:\n\t%s\n", tStr)
+	b := broadcast{
+		msg:    []byte(tStr),
+		notify: nil,
+	}
+	broadcasts.QueueBroadcast(&b)
+}
+
+func sendTimeAck() {
+	fmt.Println("ACK")
+}
+
+func validateTimeUpdate() (bool, error) {
+	return true, nil
 }
 
 func CreateCluster() {
-	if err := start(); err != nil {
+	list, err := start()
+	if err != nil {
 		fmt.Println(err)
 	}
 
+	hostname, _ := os.Hostname()
+	isMasterNode := hostname == "node01"
+
 	for {
-		time.Sleep(time.Second)
-		if hostname, _ := os.Hostname(); hostname != "node01" {
-			b := broadcast{msg: []byte("hello world"), notify: nil}
-			broadcasts.QueueBroadcast(&b)
+		if list.NumMembers() == 2 {
+			if isMasterNode {
+				proposeNewTime()
+			}
+		} else {
+			fmt.Println("Num members:", list.NumMembers())
 		}
+
+		time.Sleep(time.Second * 5)
+		// if hostname, _ := os.Hostname(); hostname != "node01" {
+		// 	b := broadcast{msg: []byte("hello world"), notify: nil}
+		// 	broadcasts.QueueBroadcast(&b)
+		// }
 
 	}
 }
