@@ -1,2 +1,2 @@
 # gomob
-A synchronised cluster of nodes making a series of requests over HTTP
+Library to synchronize code execution across multiple nodes.
