@@ -5,32 +5,42 @@ package gomob
 import (
 	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
 	"os"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
+	"github.com/hashicorp/logutils"
 	"github.com/hashicorp/memberlist"
 	"github.com/pborman/uuid"
 )
 
 var (
-	mtx             sync.RWMutex
-	members         = flag.String("members", "", "comma seperated list of members")
-	port            = flag.Int("port", 4001, "http port")
-	items           = map[string]string{}
-	broadcasts      *memberlist.TransmitLimitedQueue
-	isMasterNode    = flag.Bool("master", false, "define as master node")
+	mtx        sync.RWMutex
+	items      = map[string]string{}
+	broadcasts *memberlist.TransmitLimitedQueue
+	ackCount   = 0
+	done       chan bool
+	settings   *ConsensusSettings
+)
+
+const (
 	timeProposeFlag = 'T'
 	executeFlag     = 'E'
 	ackFlag         = 'A'
-	ackCount        = 0
-	minAcks         int
-	done            chan bool
+	secondsOffset   = 30
 )
+
+// ConsensusSettings settings to setup a cluster.
+// Members is a comma-seperated list of IP addresses of known nodes (in theory, only one node needs to be known—gossip based discovery will handle the rest).
+// Master if true, act as the master node and begin the process of time proposal.
+// NumNodes is the expected number of nodes in the cluster. Consensus won't be reached until this number of nodes have ACK'd a proposed start time.
+type ConsensusSettings struct {
+	Members  []string
+	Master   bool
+	NumNodes int
+}
 
 type broadcast struct {
 	msg    []byte
@@ -42,10 +52,6 @@ type delegate struct{}
 type update struct {
 	Action string // add, del
 	Data   map[string]string
-}
-
-func init() {
-	flag.Parse()
 }
 
 func (b *broadcast) Invalidates(other memberlist.Broadcast) bool {
@@ -85,10 +91,10 @@ func (d *delegate) NotifyMsg(b []byte) {
 			fmt.Println("Time not accepted")
 		}
 	case byte(ackFlag):
-		if *isMasterNode {
+		if settings.Master {
 			mtx.Lock()
 			ackCount++
-			if ackCount == minAcks {
+			if ackCount == settings.NumNodes-1 {
 				t := proposeNewTime(true)
 				go func() {
 					err := blockUntilTime(fmt.Sprintf("%d", t.Unix()))
@@ -150,30 +156,39 @@ func setup() (*memberlist.Memberlist, error) {
 	c.Delegate = &delegate{}
 	c.BindPort = 7777
 	c.Name = hostname + "-" + uuid.NewUUID().String()
+
+	filter := &logutils.LevelFilter{
+		Levels:   []logutils.LogLevel{"DEBUG", "WARN", "ERROR"},
+		MinLevel: logutils.LogLevel("WARN"),
+		Writer:   os.Stderr,
+	}
+
+	c.LogOutput = filter
+
 	list, err := memberlist.Create(c)
 	if err != nil {
 		return nil, err
 	}
-	if len(*members) > 0 {
-		parts := strings.Split(*members, ",")
-		_, err := list.Join(parts)
+
+	if len(settings.Members) > 0 {
+		_, err := list.Join(settings.Members)
 		if err != nil {
 			return nil, err
 		}
 	}
+
 	broadcasts = &memberlist.TransmitLimitedQueue{
 		NumNodes: func() int {
 			return list.NumMembers()
 		},
-		RetransmitMult: 2,
+		RetransmitMult: list.NumMembers() - 1,
 	}
-	node := list.LocalNode()
-	fmt.Printf("Local member %s:%d\n", node.Addr, node.Port)
+
 	return list, nil
 }
 
 func proposeNewTime(finalize bool) time.Time {
-	t := time.Now().UTC().Add(time.Second * 30).Unix()
+	t := time.Now().UTC().Add(time.Second * secondsOffset).Unix()
 	var flag rune
 	if finalize {
 		flag = executeFlag
@@ -181,7 +196,6 @@ func proposeNewTime(finalize bool) time.Time {
 		flag = timeProposeFlag
 	}
 	tStr := fmt.Sprintf("%c%d", flag, t)
-	fmt.Printf("Sending message:\n\t%s\n", tStr)
 	b := broadcast{
 		msg:    []byte(tStr),
 		notify: nil,
@@ -225,38 +239,39 @@ func blockUntilTime(unix string) error {
 	return nil
 }
 
-func WaitOnConsensus() {
+// WaitOnConsensus wait for all nodes to be ready before returning
+func WaitOnConsensus(s *ConsensusSettings) error {
+	settings = s
 	list, err := setup()
 	if err != nil {
-		fmt.Println(err)
+		return err
 	}
 
-	if *isMasterNode {
+	if settings.Master {
 		fmt.Println("Starting up as master node.")
 	}
 
 	done = make(chan bool)
 
 	go func() {
+		fmt.Println("Waiting for all worker nodes to connect...")
 		for {
-			broadcasts.RetransmitMult = list.NumMembers() - 1
-			minAcks = 2
-			if list.NumMembers() > 1 {
-				if *isMasterNode {
+			if list.NumMembers() == settings.NumNodes {
+				broadcasts.RetransmitMult = list.NumMembers() - 1
+				if settings.Master && list.NumMembers() >= settings.NumNodes {
 					mtx.Lock()
 					ackCount = 0
 					mtx.Unlock()
 					proposeNewTime(false)
-					time.Sleep(time.Second * 30) // wait until expiry time has passed before proposing again
+					time.Sleep(time.Second * secondsOffset) // wait until expiry time has passed before proposing again
 				}
 			} else {
-				fmt.Println("Num members:", list.NumMembers())
-				time.Sleep(time.Second * 5)
+				time.Sleep(time.Second * (secondsOffset / 5))
 			}
 		}
 	}()
 
-	fmt.Println("Waiting to receive done message")
-	isDone := <-done
-	fmt.Println("Done:", isDone)
+	<-done
+
+	return nil
 }
