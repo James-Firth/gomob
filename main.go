@@ -23,14 +23,19 @@ func main() {
 	if len(*members) > 0 {
 		m = strings.Split(*members, ",")
 	}
+
 	s := gomob.ConsensusSettings{
 		Members:  m,
 		Master:   *isMasterNode,
 		NumNodes: 3,
 	}
+
 	err := gomob.WaitOnConsensus(&s)
 	if err != nil {
 		panic(err)
 	}
+
+	// The code here will execute only when all nodes have reached synchronicity
+
 	fmt.Println("Consensus at:", time.Now())
 }
