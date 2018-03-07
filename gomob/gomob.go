@@ -38,12 +38,13 @@ import (
 )
 
 var (
-	mtx        sync.RWMutex
-	items      = map[string]string{}
-	broadcasts *memberlist.TransmitLimitedQueue
-	ackCount   = 0
-	done       chan bool
-	settings   *ConsensusSettings
+	mtx              sync.RWMutex
+	items            = map[string]string{}
+	broadcasts       *memberlist.TransmitLimitedQueue
+	ackCount         = 0
+	done             chan bool
+	settings         *ConsensusSettings
+	consensusReached bool
 )
 
 const (
@@ -134,6 +135,7 @@ func (d *delegate) NotifyMsg(b []byte) {
 		if err != nil {
 			panic(err)
 		}
+		consensusReached = true
 		fmt.Println("Executing now...")
 		done <- true
 	default:
@@ -213,6 +215,7 @@ func proposeNewTime(finalize bool) time.Time {
 	var flag rune
 	if finalize {
 		flag = executeFlag
+		consensusReached = true
 	} else {
 		flag = timeProposeFlag
 	}
@@ -285,21 +288,27 @@ func WaitOnConsensus(s *ConsensusSettings) error {
 		}
 
 		prevMemb := 0
+		consensusReached = false
 		for {
 			currMemb := list.NumMembers()
-			if currMemb == settings.NumNodes {
-				fmt.Printf("Attempting to establish consensus with %d other nodes...\n", settings.NumNodes-1)
-				broadcasts.RetransmitMult = currMemb - 1
-				if settings.Master && currMemb >= settings.NumNodes {
-					mtx.Lock()
-					ackCount = 0
-					mtx.Unlock()
+			broadcasts.RetransmitMult = currMemb - 1
+			if settings.Master && currMemb >= settings.NumNodes {
+				mtx.Lock()
+				ackCount = 0
+				mtx.Unlock()
+				if !consensusReached {
+					fmt.Printf("Attempting to establish consensus with %d other nodes...\n",
+						settings.NumNodes-1)
 					proposeNewTime(false)
-					time.Sleep(time.Second * secondsOffset) // wait until expiry time has passed before proposing again
+					consensusReached = false // in case state is somehow wrong; only skip one iteration
 				}
+
+				// wait for timeout before proposing again
+				time.Sleep(time.Second * secondsOffset)
 			} else {
 				if settings.Master && prevMemb != currMemb {
-					fmt.Printf("Waiting for cluster to reach size of: %d\n\tCurrent size is: %d\n", settings.NumNodes, list.NumMembers())
+					fmt.Printf("Waiting for cluster to reach size of: %d\n\tCurrent size is: %d\n",
+						settings.NumNodes, list.NumMembers())
 				}
 				prevMemb = currMemb
 				time.Sleep(time.Second * (secondsOffset / 5))
