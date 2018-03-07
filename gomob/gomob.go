@@ -50,7 +50,7 @@ const (
 	timeProposeFlag = 'T'
 	executeFlag     = 'E'
 	ackFlag         = 'A'
-	secondsOffset   = 30
+	secondsOffset   = 15
 )
 
 // ConsensusSettings settings to setup a cluster.
@@ -173,7 +173,7 @@ func (d *delegate) MergeRemoteState(buf []byte, join bool) {
 
 func setup() (*memberlist.Memberlist, error) {
 	hostname, _ := os.Hostname()
-	c := memberlist.DefaultLocalConfig()
+	c := memberlist.DefaultWANConfig()
 	c.Delegate = &delegate{}
 	c.BindPort = 7777
 	c.Name = hostname + "-" + uuid.NewUUID().String()
@@ -278,11 +278,19 @@ func WaitOnConsensus(s *ConsensusSettings) error {
 	done = make(chan bool)
 
 	go func() {
-		fmt.Printf("Waiting for %d nodes to connect to cluster...", settings.NumNodes)
+
+		// If a single node "cluster" is used, exit immediately. Sync is easy on a single machine...
+		if settings.NumNodes == 1 && settings.Master {
+			done <- true
+		}
+
+		prevMemb := 0
 		for {
-			if list.NumMembers() == settings.NumNodes {
-				broadcasts.RetransmitMult = list.NumMembers() - 1
-				if settings.Master && list.NumMembers() >= settings.NumNodes {
+			currMemb := list.NumMembers()
+			if currMemb == settings.NumNodes {
+				fmt.Printf("Attempting to establish consensus with %d other nodes...\n", settings.NumNodes-1)
+				broadcasts.RetransmitMult = currMemb - 1
+				if settings.Master && currMemb >= settings.NumNodes {
 					mtx.Lock()
 					ackCount = 0
 					mtx.Unlock()
@@ -290,6 +298,10 @@ func WaitOnConsensus(s *ConsensusSettings) error {
 					time.Sleep(time.Second * secondsOffset) // wait until expiry time has passed before proposing again
 				}
 			} else {
+				if settings.Master && prevMemb != currMemb {
+					fmt.Printf("Waiting for cluster to reach size of: %d\n\tCurrent size is: %d\n", settings.NumNodes, list.NumMembers())
+				}
+				prevMemb = currMemb
 				time.Sleep(time.Second * (secondsOffset / 5))
 			}
 		}

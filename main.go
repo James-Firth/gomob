@@ -10,8 +10,9 @@ import (
 )
 
 var (
-	members      = flag.String("members", "", "comma seperated list of members")
-	isMasterNode = flag.Bool("master", false, "define as master node")
+	members      = flag.String("peers", "", "Comma seperated list of peers. Only one known peer is required. Gossip will handle the rest.")
+	isMasterNode = flag.Bool("master", false, "Define as master node")
+	numNodes     = flag.Int("num_nodes", 1, "The number of nodes in the cluster")
 )
 
 func init() {
@@ -27,7 +28,7 @@ func main() {
 	s := gomob.ConsensusSettings{
 		Members:  m,
 		Master:   *isMasterNode,
-		NumNodes: 3,
+		NumNodes: *numNodes,
 	}
 
 	err := gomob.WaitOnConsensus(&s)
