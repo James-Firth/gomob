@@ -1,4 +1,6 @@
 # goMob
+<img align="right" width="100" height="100" src="https://user-images.githubusercontent.com/10404392/37177578-837ba1ae-22e5-11e8-94b0-0167bdc9b8fe.png" />
+
 [![Build Status](https://travis-ci.org/MattMcMurray/gomob.svg?branch=master)](https://travis-ci.org/MattMcMurray/gomob)
 
 goMob is an easy-to-use library and commandline tool to synchronize code execution across a small number of nodes.
