@@ -27,6 +27,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"strconv"
 	"sync"
@@ -45,6 +46,7 @@ var (
 	done             chan bool
 	settings         *ConsensusSettings
 	consensusReached bool
+	mlist            *memberlist.Memberlist
 )
 
 const (
@@ -99,8 +101,8 @@ func (d *delegate) NotifyMsg(b []byte) {
 		return
 	}
 
-	fmt.Println("Received message notification:")
-	fmt.Printf("\t%s\n", string(b))
+	log.Println("Received message notification:")
+	log.Printf("\t%s\n", string(b))
 	switch b[0] {
 	case byte(timeProposeFlag):
 		accept, err := validateTimeUpdate(string(b[1:]))
@@ -110,33 +112,34 @@ func (d *delegate) NotifyMsg(b []byte) {
 		if accept {
 			sendTimeAck()
 		} else {
-			fmt.Println("Time not accepted")
+			log.Println("Time not accepted")
 		}
 	case byte(ackFlag):
 		if settings.Master {
 			mtx.Lock()
 			ackCount++
 			if ackCount == settings.NumNodes-1 {
-				t := proposeNewTime(true)
+				t := sendExecutionFlag()
 				go func() {
-					err := blockUntilTime(fmt.Sprintf("%d", t.Unix()))
+					strTime := fmt.Sprintf("%d", t.Unix())
+					err := blockUntilTime(strTime)
 					if err != nil {
 						panic(err)
 					}
-					fmt.Println("Executing now...")
+					log.Println("Executing now...")
 					done <- true
 				}()
 			}
 			mtx.Unlock()
 		}
 	case byte(executeFlag):
-		fmt.Println("preparing to execute")
-		err := blockUntilTime(string(b[1:]))
+		strTime := string(b[1:])
+		log.Printf("Execute message received. Executing at (UNIX) %s\n", strTime)
+		consensusReached = true
+		err := blockUntilTime(strTime)
 		if err != nil {
 			panic(err)
 		}
-		consensusReached = true
-		fmt.Println("Executing now...")
 		done <- true
 	default:
 		panic(errors.New("Unkown message type received"))
@@ -173,7 +176,7 @@ func (d *delegate) MergeRemoteState(buf []byte, join bool) {
 	mtx.Unlock()
 }
 
-func setup() (*memberlist.Memberlist, error) {
+func setup() error {
 	hostname, _ := os.Hostname()
 	c := memberlist.DefaultWANConfig()
 	c.Delegate = &delegate{}
@@ -188,38 +191,45 @@ func setup() (*memberlist.Memberlist, error) {
 
 	c.LogOutput = filter
 
-	list, err := memberlist.Create(c)
+	var err error
+	mlist, err = memberlist.Create(c)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	if len(settings.Members) > 0 {
-		_, err := list.Join(settings.Members)
+		_, err := mlist.Join(settings.Members)
 		if err != nil {
-			return nil, err
+			return err
 		}
 	}
 
 	broadcasts = &memberlist.TransmitLimitedQueue{
 		NumNodes: func() int {
-			return list.NumMembers()
+			return mlist.NumMembers()
 		},
-		RetransmitMult: list.NumMembers() - 1,
+		RetransmitMult: mlist.NumMembers() - 1,
 	}
 
-	return list, nil
+	return nil
 }
 
-func proposeNewTime(finalize bool) time.Time {
+func sendExecutionFlag() time.Time {
 	t := time.Now().UTC().Add(time.Second * secondsOffset).Unix()
-	var flag rune
-	if finalize {
-		flag = executeFlag
-		consensusReached = true
-	} else {
-		flag = timeProposeFlag
+	tStr := fmt.Sprintf("%c%d", executeFlag, t)
+
+	// This means the master node will send an execution message to itself, but that's on purpose.
+	for _, node := range mlist.Members() {
+		mlist.SendReliable(node, []byte(tStr))
 	}
-	tStr := fmt.Sprintf("%c%d", flag, t)
+	consensusReached = true
+
+	return time.Unix(t, 0)
+}
+
+func proposeNewTime() time.Time {
+	t := time.Now().UTC().Add(time.Second * secondsOffset).Unix()
+	tStr := fmt.Sprintf("%c%d", timeProposeFlag, t)
 	b := broadcast{
 		msg:    []byte(tStr),
 		notify: nil,
@@ -268,14 +278,15 @@ func blockUntilTime(unix string) error {
 
 // WaitOnConsensus wait for all nodes to be ready before returning
 func WaitOnConsensus(s *ConsensusSettings) error {
+	log.SetPrefix(" [gomob] ")
 	settings = s
-	list, err := setup()
+	err := setup()
 	if err != nil {
 		return err
 	}
 
 	if settings.Master {
-		fmt.Println("Starting up as master node.")
+		log.Println("Starting up as master node.")
 	}
 
 	done = make(chan bool)
@@ -290,16 +301,17 @@ func WaitOnConsensus(s *ConsensusSettings) error {
 		prevMemb := 0
 		consensusReached = false
 		for {
-			currMemb := list.NumMembers()
+			currMemb := mlist.NumMembers()
 			broadcasts.RetransmitMult = currMemb - 1
+
 			if settings.Master && currMemb >= settings.NumNodes {
 				mtx.Lock()
 				ackCount = 0
 				mtx.Unlock()
 				if !consensusReached {
-					fmt.Printf("Attempting to establish consensus with %d other nodes...\n",
+					log.Printf("Attempting to establish consensus with %d other nodes...\n",
 						settings.NumNodes-1)
-					proposeNewTime(false)
+					proposeNewTime()
 					consensusReached = false // in case state is somehow wrong; only skip one iteration
 				}
 
@@ -307,8 +319,8 @@ func WaitOnConsensus(s *ConsensusSettings) error {
 				time.Sleep(time.Second * secondsOffset)
 			} else {
 				if settings.Master && prevMemb != currMemb {
-					fmt.Printf("Waiting for cluster to reach size of: %d\n\tCurrent size is: %d\n",
-						settings.NumNodes, list.NumMembers())
+					log.Printf("Waiting for cluster to reach size of: %d\n\tCurrent size is: %d\n",
+						settings.NumNodes, mlist.NumMembers())
 				}
 				prevMemb = currMemb
 				time.Sleep(time.Second * (secondsOffset / 5))
