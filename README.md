@@ -25,7 +25,7 @@ gomob -peers 192.168.50.10 && \
     ./my-code-to-run.sh
 ```
 
-#### Node 2
+#### Node 3
 **IP = `192.168.50.30`**
 
 `-peers` need not point directly to master. In this case, `-peers` points to the 2nd node. Gossip based discovery will connect all nodes together eventually.
