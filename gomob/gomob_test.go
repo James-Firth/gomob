@@ -3,22 +3,17 @@ package gomob
 import (
 	"fmt"
 	"regexp"
+	"strconv"
 	"testing"
 	"time"
 
 	"github.com/hashicorp/memberlist"
 )
 
-type mockBroadcasts struct{}
-
-func (mockBroadcasts) QueueBroadcast(*interface{}) {
-	fmt.Println("Method called")
-}
-
 func TestProposeNewTime(t *testing.T) {
 	m := &memberlist.TransmitLimitedQueue{}
 	broadcasts = m
-	pTime := proposeNewTime(false)
+	pTime := proposeNewTime()
 	if pTime.Unix() < time.Now().Unix() {
 		t.Fail()
 	}
@@ -92,5 +87,23 @@ func TestBlockUntilTime(t *testing.T) {
 	if !match {
 		t.Error("Unexpected error thrown", err)
 	}
+}
 
+func TestGetFormattedTimeString(t *testing.T) {
+	flag := 'T'
+	tStr, time := getFormattedTimeString(flag)
+
+	if rune(tStr[0]) != flag {
+		t.Error("Incorrect flag added to time string")
+	}
+
+	tInt, err := strconv.Atoi(tStr[1:])
+	if err != nil {
+		t.Log(err)
+		t.Error("Error thrown when trying to parse unix time string")
+	}
+
+	if int64(tInt) != time.Unix() {
+		t.Error("Returned time does not match time in returned string")
+	}
 }

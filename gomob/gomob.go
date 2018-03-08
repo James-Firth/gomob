@@ -214,29 +214,31 @@ func setup() error {
 	return nil
 }
 
-func sendExecutionFlag() time.Time {
+func getFormattedTimeString(flag rune) (string, time.Time) {
 	t := time.Now().UTC().Add(time.Second * secondsOffset).Unix()
-	tStr := fmt.Sprintf("%c%d", executeFlag, t)
+	return fmt.Sprintf("%c%d", flag, t), time.Unix(t, 0)
+}
 
+func sendExecutionFlag() time.Time {
+	tStr, t := getFormattedTimeString(executeFlag)
 	// This means the master node will send an execution message to itself, but that's on purpose.
 	for _, node := range mlist.Members() {
 		mlist.SendReliable(node, []byte(tStr))
 	}
 	consensusReached = true
 
-	return time.Unix(t, 0)
+	return t
 }
 
 func proposeNewTime() time.Time {
-	t := time.Now().UTC().Add(time.Second * secondsOffset).Unix()
-	tStr := fmt.Sprintf("%c%d", timeProposeFlag, t)
+	tStr, t := getFormattedTimeString(timeProposeFlag)
 	b := broadcast{
 		msg:    []byte(tStr),
 		notify: nil,
 	}
 	broadcasts.QueueBroadcast(&b)
 
-	return time.Unix(t, 0)
+	return t
 }
 
 func sendTimeAck() {
